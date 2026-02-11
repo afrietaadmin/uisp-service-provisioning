@@ -7,6 +7,13 @@ from app.infra.uisp import UISPClient, format_mac_address
 logger = logging.getLogger(__name__)
 
 
+def clean_ip_address(ip_with_cidr: str) -> str:
+    """Remove CIDR notation from IP address (e.g., 100.64.12.99/32 -> 100.64.12.99)."""
+    if ip_with_cidr and '/' in ip_with_cidr:
+        return ip_with_cidr.split('/')[0]
+    return ip_with_cidr
+
+
 def get_router_config(assigned_nas: str) -> dict:
     """Load router configuration from nas_config.json based on assigned NAS name."""
     import json
@@ -76,17 +83,18 @@ def provision_service(service_id: int, client_id: int, mac_address: str, assigne
         # Find free IP (excluding the router IP)
         logger.info(f"Searching for free IP in range {dhcp_range} (excluding router {router_ip})")
         free_ip = mt.find_first_free_ip(dhcp_range, exclude_ip=router_ip)
+        clean_free_ip = clean_ip_address(free_ip)
         logger.info(f"Allocated free IP: {free_ip} for Service {service_id} (MAC: {formatted_mac})")
-        tg.send(f"Allocated IP {free_ip} from {dhcp_range} | Service: {final_service_identifier} | MAC: {formatted_mac}", level="info")
+        tg.send(f"Allocated IP {clean_free_ip} from {dhcp_range} | Service: {final_service_identifier} | MAC: {formatted_mac}", level="info")
 
         # Create DHCP lease using the generated service identifier and formatted MAC
         try:
             mt.create_dhcp_lease(free_ip, formatted_mac, final_service_identifier)
             logger.info(f"DHCP lease created for {free_ip}")
-            tg.send(f"DHCP lease created: {free_ip} | MAC: {formatted_mac}", level="info")
+            tg.send(f"DHCP lease created: {clean_free_ip} | MAC: {formatted_mac}", level="info")
         except Exception as e:
             logger.error(f"DHCP lease creation failed for {free_ip}: {e}")
-            tg.send(f"❌ DHCP lease creation failed for {free_ip}: {str(e)}", level="error")
+            tg.send(f"DHCP lease creation failed for {clean_free_ip}: {str(e)}", level="error")
             raise
 
         # Create queue on dedicated queue router (102.209.144.2) irrespective of assigned NAS
@@ -104,16 +112,16 @@ def provision_service(service_id: int, client_id: int, mac_address: str, assigne
         except Exception as e:
             logger.error(f"Queue creation failed on {queue_router_ip} for IP {free_ip}: {e}")
             logger.warning(f"Attempting to rollback DHCP lease for {free_ip} due to queue creation failure")
-            tg.send(f"❌ Queue creation failed on {queue_router_ip} for {final_service_identifier}: {str(e)}", level="error")
+            tg.send(f"Queue creation failed on {queue_router_ip} for {final_service_identifier}: {str(e)}", level="error")
 
             # Attempt rollback: delete the DHCP lease we just created
             try:
                 mt.delete_dhcp_lease(free_ip)
                 logger.info(f"DHCP lease rollback successful for {free_ip}")
-                tg.send(f"⚠️ DHCP lease rolled back for {free_ip} due to queue failure", level="warn")
+                tg.send(f"DHCP lease rolled back for {clean_free_ip} due to queue failure", level="warn")
             except Exception as rollback_error:
                 logger.error(f"DHCP lease rollback failed for {free_ip}: {rollback_error}")
-                tg.send(f"⚠️ CRITICAL: Could not rollback DHCP lease for {free_ip}: {str(rollback_error)}", level="error")
+                tg.send(f"CRITICAL: Could not rollback DHCP lease for {clean_free_ip}: {str(rollback_error)}", level="error")
 
             # Re-raise the queue creation error to fail the entire provisioning
             raise
@@ -122,11 +130,11 @@ def provision_service(service_id: int, client_id: int, mac_address: str, assigne
         try:
             uisp.update_service_provisioned(service_id, free_ip, final_service_identifier, formatted_mac)
             logger.info(f"UISP service {service_id} updated with IP {free_ip} and MAC {formatted_mac}")
-            tg.send(f"UISP updated: Service {service_id} provisioned with IP {free_ip} | MAC: {formatted_mac}", level="info")
+            tg.send(f"UISP updated: Service {service_id} provisioned with IP {clean_free_ip} | MAC: {formatted_mac}", level="info")
         except Exception as e:
             logger.error(f"UISP service update failed for {service_id}: {e}")
             logger.warning(f"Service {service_id} is provisioned on routers but UISP update failed. Manual cleanup may be needed.")
-            tg.send(f"⚠️ UISP update failed for service {service_id}: {str(e)}", level="error")
+            tg.send(f"UISP update failed for service {service_id}: {str(e)}", level="error")
             # Don't re-raise here - we've already provisioned on routers, so let it complete
             # but log the error prominently
 
@@ -148,6 +156,7 @@ def deprovision_service(service_id: int, assigned_nas: str, target_ip: str,
                        service_identifier: str, tg: TelegramNotifier) -> dict:
     """Deprovision a service: delete DHCP lease, queue, and update UISP."""
     cfg = load_config()
+    clean_target_ip = clean_ip_address(target_ip)
 
     try:
         # Get router configuration
@@ -168,13 +177,13 @@ def deprovision_service(service_id: int, assigned_nas: str, target_ip: str,
             lease_deleted = mt.delete_dhcp_lease(target_ip)
             if lease_deleted:
                 logger.info(f"DHCP lease deleted for {target_ip}")
-                tg.send(f"✅ DHCP lease deleted for {target_ip} ({service_identifier})", level="info")
+                tg.send(f"DHCP lease deleted for {clean_target_ip} ({service_identifier})", level="info")
             else:
                 logger.warning(f"DHCP lease not found for {target_ip}, continuing with queue deletion")
-                tg.send(f"⚠️ DHCP lease not found for {target_ip}, continuing...", level="warn")
+                tg.send(f"⚠️ DHCP lease not found for {clean_target_ip}, continuing...", level="warn")
         except Exception as e:
             logger.error(f"Error deleting DHCP lease for {target_ip}: {e}")
-            tg.send(f"⚠️ Error deleting DHCP lease for {target_ip}: {str(e)}", level="error")
+            tg.send(f"Error deleting DHCP lease for {clean_target_ip}: {str(e)}", level="error")
             lease_deleted = False
             # Continue to queue deletion attempt
 
@@ -190,13 +199,13 @@ def deprovision_service(service_id: int, assigned_nas: str, target_ip: str,
             queue_deleted = mt_queue.delete_queue(target_ip)
             if queue_deleted:
                 logger.info(f"Queue deleted for {target_ip}")
-                tg.send(f"✅ Queue deleted for {target_ip} ({service_identifier})", level="info")
+                tg.send(f"Queue deleted for {clean_target_ip} ({service_identifier})", level="info")
             else:
                 logger.warning(f"Queue not found for {target_ip}, continuing with UISP update")
-                tg.send(f"⚠️ Queue not found for {target_ip}, continuing...", level="warn")
+                tg.send(f"⚠️ Queue not found for {clean_target_ip}, continuing...", level="warn")
         except Exception as e:
             logger.error(f"Error deleting queue for {target_ip} from {queue_router_ip}: {e}")
-            tg.send(f"⚠️ Error deleting queue for {target_ip}: {str(e)}", level="error")
+            tg.send(f"Error deleting queue for {clean_target_ip}: {str(e)}", level="error")
             queue_deleted = False
             # Continue to UISP update attempt
 
@@ -205,7 +214,7 @@ def deprovision_service(service_id: int, assigned_nas: str, target_ip: str,
         uisp = UISPClient(cfg.uisp_base_url, cfg.uisp_app_key)
         uisp.update_service_deprovisioned(service_id)
         logger.info(f"UISP service {service_id} marked as deprovisioned")
-        tg.send(f"✅ UISP updated: Service {service_id} deprovisioned ({service_identifier})", level="info")
+        tg.send(f"UISP updated: Service {service_id} deprovisioned ({service_identifier})", level="info")
 
         return {
             "ok": True,
@@ -349,7 +358,6 @@ def handle_service_event(change_type: str, entity_type: str, entity_id: str, ext
         else:
             # Status is neither 1 nor 2, skip processing
             logger.warning(f"Service {service_id} has status {status}, skipping provisioning/deprovisioning")
-            tg.send(f"⏭️ Service {service_name} (CID: {client_id}) status {status} - no action taken", level="info")
             return {
                 "ok": True,
                 "message": f"Service status {status} - no provisioning/deprovisioning action required",
