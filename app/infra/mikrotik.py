@@ -73,8 +73,8 @@ class MikroTikClient:
     def find_first_free_ip(self, dhcp_range: str, exclude_ip: str = None) -> str:
         """Find the first unused IP address within the DHCP range.
 
-        Only searches for IPs within the specified DHCP range that are not currently in use.
-        Ignores all IPs outside the range, even if they are used elsewhere.
+        STRICT VALIDATION: Only searches for IPs within the specified DHCP range.
+        Will NOT allocate IPs outside the defined boundaries.
 
         Supports both formats:
         - CIDR notation: 100.64.16.0/23
@@ -83,57 +83,104 @@ class MikroTikClient:
         Args:
             dhcp_range: The DHCP range to search within
             exclude_ip: Optional IP address to exclude (e.g., router IP)
+
+        Raises:
+            ValueError: If no free IPs within range or invalid range format
         """
         try:
+            # Parse and validate the range format FIRST
+            if '/' in dhcp_range:
+                network = ipaddress.IPv4Network(dhcp_range, strict=False)
+                # Skip network and broadcast addresses, start from .1
+                start_ip = ipaddress.IPv4Address(int(network.network_address) + 1)
+                end_ip = ipaddress.IPv4Address(int(network.broadcast_address) - 1)
+                range_type = "CIDR"
+            elif '-' in dhcp_range:
+                start_ip_str, end_ip_str = dhcp_range.split('-')
+                start_ip = ipaddress.IPv4Address(start_ip_str.strip())
+                end_ip = ipaddress.IPv4Address(end_ip_str.strip())
+                range_type = "range"
+            else:
+                raise ValueError(f"Invalid DHCP range format: {dhcp_range}. Use CIDR (e.g., 100.64.16.0/23) or range (e.g., 100.64.16.20-100.64.21.254)")
+
+            # Validate range makes sense
+            if start_ip >= end_ip:
+                raise ValueError(f"Invalid DHCP range: start {start_ip} must be less than end {end_ip}")
+
+            total_ips = int(end_ip) - int(start_ip) + 1
+            logger.info(f"DHCP Range [{range_type}]: {dhcp_range} → {start_ip} to {end_ip} ({total_ips} total IPs)")
+
             # Get used IPs ONLY within the specified DHCP range
             used_ips = self.get_used_ips(dhcp_range=dhcp_range)
+            logger.info(f"Found {len(used_ips)} used IPs in range")
 
             # Add router IP to excluded IPs
             if exclude_ip:
                 used_ips.add(exclude_ip)
                 logger.info(f"Excluding router IP from available pool: {exclude_ip}")
 
-            # Handle CIDR notation (e.g., 100.64.16.0/23)
-            if '/' in dhcp_range:
-                network = ipaddress.IPv4Network(dhcp_range, strict=False)
-                # Skip network and broadcast addresses, start from .1
-                start_ip = ipaddress.IPv4Address(int(network.network_address) + 1)
-                end_ip = ipaddress.IPv4Address(int(network.broadcast_address) - 1)
-            # Handle range notation (e.g., 100.64.16.0-100.64.16.255)
-            elif '-' in dhcp_range:
-                start_ip_str, end_ip_str = dhcp_range.split('-')
-                start_ip = ipaddress.IPv4Address(start_ip_str.strip())
-                end_ip = ipaddress.IPv4Address(end_ip_str.strip())
-            else:
-                raise ValueError(f"Invalid DHCP range format: {dhcp_range}. Use CIDR (e.g., 100.64.16.0/23) or range (e.g., 100.64.16.0-100.64.16.255)")
+            available_count = total_ips - len(used_ips)
+            logger.info(f"Available IPs in range: {available_count}/{total_ips}")
 
-            logger.info(f"Searching for free IP in range {dhcp_range} ({start_ip} to {end_ip}), Used IPs in range: {used_ips}")
+            # Only iterate within the defined range boundaries
+            for ip_int in range(int(start_ip), int(end_ip) + 1):
+                ip_str = str(ipaddress.IPv4Address(ip_int))
 
-            for ip in range(int(start_ip), int(end_ip) + 1):
-                ip_str = str(ipaddress.IPv4Address(ip))
+                # Double-check IP is actually in range (should always be true)
+                if not (start_ip <= ipaddress.IPv4Address(ip_str) <= end_ip):
+                    logger.error(f"CRITICAL: IP {ip_str} is outside defined range {dhcp_range}!")
+                    continue
+
                 if ip_str not in used_ips:
-                    logger.info(f"Found free IP: {ip_str} in range {dhcp_range}")
+                    logger.info(f"Allocated free IP: {ip_str} (position {ip_int - int(start_ip) + 1}/{total_ips} in range)")
                     return ip_str
 
-            raise ValueError(f"No free IPs found in the specified DHCP range {dhcp_range}")
+            # Range exhausted - provide diagnostic info
+            logger.error(f"DHCP range exhausted: {dhcp_range}")
+            logger.error(f"Used IPs: {sorted(used_ips)}")
+            raise ValueError(f"DHCP range {dhcp_range} is exhausted ({available_count}/{total_ips} available). Cannot provision service.")
+
+        except ipaddress.AddressValueError as e:
+            logger.error(f"Invalid IP address in range: {e}")
+            raise ValueError(f"Invalid DHCP range format: {dhcp_range}. Error: {e}")
         except Exception as e:
             logger.error(f"Error finding free IP: {e}")
             raise
 
     def create_dhcp_lease(self, ip_address: str, mac_address: str, comment: str) -> dict:
-        """Create a new DHCP lease. Deletes any existing lease with the same MAC first."""
+        """Create a new DHCP lease. Deletes any existing lease with the same MAC first.
+
+        Handles MAC address format variations (with/without colons or dashes).
+        """
         try:
+            # Normalize MAC address for comparison (remove all separators)
+            normalized_mac = mac_address.replace(":", "").replace("-", "").upper()
+
             # First, try to delete any existing lease with the same MAC address
             # This handles the case where a static lease already exists
             try:
                 leases = self._req("GET", "ip/dhcp-server/lease")
+                deleted_count = 0
+
                 for lease in leases:
-                    if lease.get("mac-address", "").upper() == mac_address.upper():
+                    # Normalize the lease's MAC for comparison
+                    lease_mac = lease.get("mac-address", "").replace(":", "").replace("-", "").upper()
+
+                    if lease_mac == normalized_mac:
                         lease_id = lease.get(".id")
-                        logger.info(f"Found existing lease with MAC {mac_address}, lease ID: {lease_id}. Deleting...")
+                        lease_ip = lease.get("address")
+                        logger.warning(
+                            f"Found existing lease with MAC {mac_address} at IP {lease_ip}, "
+                            f"lease ID: {lease_id}. Deleting to prevent duplicates..."
+                        )
                         self._req("DELETE", f"ip/dhcp-server/lease/{lease_id}")
-                        logger.info(f"Deleted existing lease for MAC {mac_address}")
-                        break
+                        logger.info(f"Deleted existing lease for MAC {mac_address} (was at {lease_ip})")
+                        deleted_count += 1
+
+                if deleted_count > 1:
+                    logger.error(f"WARNING: Found and deleted {deleted_count} leases with same MAC {mac_address}! "
+                                f"This indicates a duplicate lease problem.")
+
             except Exception as e:
                 logger.warning(f"Could not check/delete existing leases: {e}. Continuing with creation...")
 
@@ -180,8 +227,47 @@ class MikroTikClient:
             raise
 
     def create_queue(self, target_ip: str, name: str, upload_speed: int, download_speed: int) -> dict:
-        """Create a traffic shaping queue."""
+        """Create or update a traffic shaping queue. Updates any existing queue for the same IP or name."""
         try:
+            # First, check if a queue already exists for this IP or name and update it
+            try:
+                queues = self._req("GET", "queue/simple")
+                updated_count = 0
+
+                for queue in queues:
+                    queue_target = queue.get("target", "").split('/')[0] if queue.get("target") else ""
+                    queue_name = queue.get("name", "")
+
+                    # Update if same IP or same name (handles both duplicates and service re-provisioning)
+                    if queue_target == target_ip or queue_name == name:
+                        queue_id = queue.get(".id")
+                        old_limits = queue.get("max-limit", "N/A")
+                        reason = "same IP" if queue_target == target_ip else "same name"
+                        logger.warning(
+                            f"Found existing queue with {reason} ({reason == 'same IP' and target_ip or name}) "
+                            f"with limits {old_limits}, queue ID: {queue_id}. Updating with new parameters..."
+                        )
+
+                        # Update the existing queue with new parameters
+                        update_data = {
+                            "name": name,
+                            "comment": name,
+                            "max-limit": f"{upload_speed}M/{download_speed}M"
+                        }
+                        self._req("PATCH", f"queue/simple/{queue_id}", json=update_data)
+                        logger.info(f"Updated existing queue ({reason}) with new limits: {upload_speed}M/{download_speed}M")
+                        updated_count += 1
+
+                if updated_count > 1:
+                    logger.warning(f"WARNING: Found and updated {updated_count} queues! "
+                                f"This indicates multiple queues with similar parameters.")
+                elif updated_count == 1:
+                    logger.info(f"Queue successfully updated instead of creating new one")
+                    return {"message": "Queue updated successfully"}
+
+            except Exception as e:
+                logger.warning(f"Could not check/update existing queues: {e}. Proceeding to create new queue...")
+
             queue_data = {
                 "target": target_ip,
                 "name": name,
@@ -189,12 +275,12 @@ class MikroTikClient:
                 "max-limit": f"{upload_speed}M/{download_speed}M",
                 "queue": "default/default"
             }
-            logger.debug(f"Creating queue with data: {queue_data}")
+            logger.debug(f"Creating new queue with data: {queue_data}")
             result = self._req("POST", "queue/simple/add", json=queue_data)
             logger.info(f"Queue created for {target_ip} ({upload_speed}M/{download_speed}M)")
             return result
         except Exception as e:
-            logger.error(f"Error creating queue: {e}")
+            logger.error(f"Error creating/updating queue: {e}")
             raise
 
     def delete_queue(self, target_ip: str) -> bool:

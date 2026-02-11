@@ -74,30 +74,67 @@ def provision_service(service_id: int, client_id: int, mac_address: str, assigne
         mt = MikroTikClient(api_url, username, password)
 
         # Find free IP (excluding the router IP)
+        logger.info(f"Searching for free IP in range {dhcp_range} (excluding router {router_ip})")
         free_ip = mt.find_first_free_ip(dhcp_range, exclude_ip=router_ip)
-        logger.info(f"Found free IP: {free_ip}")
-        tg.send(f"Found free IP: {free_ip} | MAC: {formatted_mac}", level="info")
+        logger.info(f"Allocated free IP: {free_ip} for Service {service_id} (MAC: {formatted_mac})")
+        tg.send(f"Allocated IP {free_ip} from {dhcp_range} | Service: {final_service_identifier} | MAC: {formatted_mac}", level="info")
 
         # Create DHCP lease using the generated service identifier and formatted MAC
-        mt.create_dhcp_lease(free_ip, formatted_mac, final_service_identifier)
-        logger.info(f"DHCP lease created for {free_ip}")
-        tg.send(f"DHCP lease created: {free_ip} | MAC: {formatted_mac}", level="info")
+        try:
+            mt.create_dhcp_lease(free_ip, formatted_mac, final_service_identifier)
+            logger.info(f"DHCP lease created for {free_ip}")
+            tg.send(f"DHCP lease created: {free_ip} | MAC: {formatted_mac}", level="info")
+        except Exception as e:
+            logger.error(f"DHCP lease creation failed for {free_ip}: {e}")
+            tg.send(f"❌ DHCP lease creation failed for {free_ip}: {str(e)}", level="error")
+            raise
+
+        # Create queue on dedicated queue router (102.209.144.2) irrespective of assigned NAS
+        queue_router_ip = "102.209.144.2"
+        queue_router_api_url = f"https://{queue_router_ip}/rest"
+        logger.info(f"Initializing MikroTik client for queue router: {queue_router_ip}")
+        # Use same username/password from the assigned NAS config
+        mt_queue = MikroTikClient(queue_router_api_url, username, password)
 
         # Create queue (traffic shaping) using the generated service identifier
-        mt.create_queue(free_ip, final_service_identifier, upload_speed, download_speed)
-        logger.info(f"Queue created: {upload_speed}M/{download_speed}M")
-        tg.send(f"Queue created: {upload_speed}M/{download_speed}M for {final_service_identifier} | MAC: {formatted_mac}", level="info")
+        try:
+            mt_queue.create_queue(free_ip, final_service_identifier, upload_speed, download_speed)
+            logger.info(f"Queue created on {queue_router_ip}: {upload_speed}M/{download_speed}M")
+            tg.send(f"Queue created on {queue_router_ip}: {upload_speed}M/{download_speed}M for {final_service_identifier} | MAC: {formatted_mac}", level="info")
+        except Exception as e:
+            logger.error(f"Queue creation failed on {queue_router_ip} for IP {free_ip}: {e}")
+            logger.warning(f"Attempting to rollback DHCP lease for {free_ip} due to queue creation failure")
+            tg.send(f"❌ Queue creation failed on {queue_router_ip} for {final_service_identifier}: {str(e)}", level="error")
+
+            # Attempt rollback: delete the DHCP lease we just created
+            try:
+                mt.delete_dhcp_lease(free_ip)
+                logger.info(f"DHCP lease rollback successful for {free_ip}")
+                tg.send(f"⚠️ DHCP lease rolled back for {free_ip} due to queue failure", level="warn")
+            except Exception as rollback_error:
+                logger.error(f"DHCP lease rollback failed for {free_ip}: {rollback_error}")
+                tg.send(f"⚠️ CRITICAL: Could not rollback DHCP lease for {free_ip}: {str(rollback_error)}", level="error")
+
+            # Re-raise the queue creation error to fail the entire provisioning
+            raise
 
         # Update UISP service attributes using the generated service identifier and formatted MAC
-        uisp.update_service_provisioned(service_id, free_ip, final_service_identifier, formatted_mac)
-        logger.info(f"UISP service {service_id} updated with IP {free_ip} and MAC {formatted_mac}")
-        tg.send(f"UISP updated: Service {service_id} provisioned with IP {free_ip} | MAC: {formatted_mac}", level="info")
+        try:
+            uisp.update_service_provisioned(service_id, free_ip, final_service_identifier, formatted_mac)
+            logger.info(f"UISP service {service_id} updated with IP {free_ip} and MAC {formatted_mac}")
+            tg.send(f"UISP updated: Service {service_id} provisioned with IP {free_ip} | MAC: {formatted_mac}", level="info")
+        except Exception as e:
+            logger.error(f"UISP service update failed for {service_id}: {e}")
+            logger.warning(f"Service {service_id} is provisioned on routers but UISP update failed. Manual cleanup may be needed.")
+            tg.send(f"⚠️ UISP update failed for service {service_id}: {str(e)}", level="error")
+            # Don't re-raise here - we've already provisioned on routers, so let it complete
+            # but log the error prominently
 
         return {
             "ok": True,
             "message": f"Service provisioned successfully",
             "free_ip": free_ip,
-            "service_identifier": service_identifier,
+            "service_identifier": final_service_identifier,
             "assigned_nas": assigned_nas
         }
 
@@ -125,25 +162,43 @@ def deprovision_service(service_id: int, assigned_nas: str, target_ip: str,
         # Initialize MikroTik client
         mt = MikroTikClient(api_url, username, password)
 
-        # Delete DHCP lease
+        # Delete DHCP lease from assigned NAS router
         logger.info(f"Attempting to delete DHCP lease for {target_ip}")
-        lease_deleted = mt.delete_dhcp_lease(target_ip)
-        if lease_deleted:
-            logger.info(f"DHCP lease deleted for {target_ip}")
-            tg.send(f"✅ DHCP lease deleted for {target_ip} ({service_identifier})", level="info")
-        else:
-            logger.warning(f"DHCP lease not found for {target_ip}, continuing with queue deletion")
-            tg.send(f"⚠️ DHCP lease not found for {target_ip}, continuing...", level="warn")
+        try:
+            lease_deleted = mt.delete_dhcp_lease(target_ip)
+            if lease_deleted:
+                logger.info(f"DHCP lease deleted for {target_ip}")
+                tg.send(f"✅ DHCP lease deleted for {target_ip} ({service_identifier})", level="info")
+            else:
+                logger.warning(f"DHCP lease not found for {target_ip}, continuing with queue deletion")
+                tg.send(f"⚠️ DHCP lease not found for {target_ip}, continuing...", level="warn")
+        except Exception as e:
+            logger.error(f"Error deleting DHCP lease for {target_ip}: {e}")
+            tg.send(f"⚠️ Error deleting DHCP lease for {target_ip}: {str(e)}", level="error")
+            lease_deleted = False
+            # Continue to queue deletion attempt
 
-        # Delete queue
-        logger.info(f"Attempting to delete queue for {target_ip}")
-        queue_deleted = mt.delete_queue(target_ip)
-        if queue_deleted:
-            logger.info(f"Queue deleted for {target_ip}")
-            tg.send(f"✅ Queue deleted for {target_ip} ({service_identifier})", level="info")
-        else:
-            logger.warning(f"Queue not found for {target_ip}, continuing with UISP update")
-            tg.send(f"⚠️ Queue not found for {target_ip}, continuing...", level="warn")
+        # Delete queue from dedicated queue router (102.209.144.2) irrespective of assigned NAS
+        queue_router_ip = "102.209.144.2"
+        queue_router_api_url = f"https://{queue_router_ip}/rest"
+        logger.info(f"Initializing MikroTik client for queue router: {queue_router_ip}")
+        # Use same username/password from the assigned NAS config
+        mt_queue = MikroTikClient(queue_router_api_url, username, password)
+
+        logger.info(f"Attempting to delete queue for {target_ip} from {queue_router_ip}")
+        try:
+            queue_deleted = mt_queue.delete_queue(target_ip)
+            if queue_deleted:
+                logger.info(f"Queue deleted for {target_ip}")
+                tg.send(f"✅ Queue deleted for {target_ip} ({service_identifier})", level="info")
+            else:
+                logger.warning(f"Queue not found for {target_ip}, continuing with UISP update")
+                tg.send(f"⚠️ Queue not found for {target_ip}, continuing...", level="warn")
+        except Exception as e:
+            logger.error(f"Error deleting queue for {target_ip} from {queue_router_ip}: {e}")
+            tg.send(f"⚠️ Error deleting queue for {target_ip}: {str(e)}", level="error")
+            queue_deleted = False
+            # Continue to UISP update attempt
 
         # Update UISP service attributes
         logger.info(f"Updating UISP service {service_id}")
@@ -230,19 +285,19 @@ def handle_service_event(change_type: str, entity_type: str, entity_id: str, ext
             f"(ID: {service_id}, Client: {client_id}, Status: {status}, MAC: {mac_address}, ProvisioningAction: {provisioning_action})"
         )
 
-        # Only provision if provisioningAction is NAS-Provision
-        if provisioning_action != "NAS-Provision":
-            logger.info(f"Service {service_id} provisioningAction is '{provisioning_action}' (not NAS-Provision), skipping provisioning/deprovisioning")
-            return {
-                "ok": True,
-                "message": "Request did not invoke any operation - informational only",
-                "service_id": service_id,
-                "status": status,
-                "provisioning_action": provisioning_action
-            }
-
         # Provision only if status is 1 (active)
         if status == 1:
+            # Check provisioning action only for provisioning
+            if provisioning_action != "NAS-Provision":
+                logger.info(f"Service {service_id} provisioningAction is '{provisioning_action}' (not NAS-Provision), skipping provisioning")
+                return {
+                    "ok": True,
+                    "message": "Request did not invoke any operation - informational only",
+                    "service_id": service_id,
+                    "status": status,
+                    "provisioning_action": provisioning_action
+                }
+
             if not all([assigned_nas, mac_address]):
                 raise ValueError("Missing required attributes for provisioning (assignedNas, macAddress)")
 
@@ -263,7 +318,7 @@ def handle_service_event(change_type: str, entity_type: str, entity_id: str, ext
                 "provisioning": result
             }
 
-        # Deprovision only if status is 2 (suspended/inactive)
+        # Deprovision only if status is 2 (ended) - no provisioning_action check needed
         elif status == 2:
             if not all([assigned_nas, ip_address, service_identifier]):
                 logger.warning(f"Cannot deprovision: missing required attributes")
@@ -276,7 +331,7 @@ def handle_service_event(change_type: str, entity_type: str, entity_id: str, ext
                 }
 
             logger.info(f"Deprovisioning service {service_id}: {service_identifier} (status={status})")
-            tg.send(f"🗑️ Deprovisioning: {service_name} (CID: {client_id}) | Status: Suspended | MAC: {mac_address}", level="warn")
+            tg.send(f"🗑️ Deprovisioning: {service_name} (CID: {client_id}) | Status: Ended | MAC: {mac_address}", level="warn")
 
             result = deprovision_service(
                 service_id, assigned_nas, ip_address, service_identifier, tg
