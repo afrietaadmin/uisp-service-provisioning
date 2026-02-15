@@ -46,7 +46,13 @@ class MikroTikClient:
         """
         try:
             leases = self._req("GET", "ip/dhcp-server/lease")
-            used_ips = {lease.get("address") for lease in leases if "address" in lease}
+            # Strip CIDR notation from IPs (MikroTik may return addresses like "100.64.14.2/32")
+            # to ensure consistent comparison in find_first_free_ip()
+            used_ips = {
+                lease.get("address", "").split('/')[0]
+                for lease in leases
+                if "address" in lease
+            }
 
             # Filter to only IPs within the specified range
             if dhcp_range:
@@ -199,17 +205,51 @@ class MikroTikClient:
             logger.error(f"Error creating DHCP lease: {e}")
             raise
 
+    def get_dhcp_lease_details(self, target_ip: str) -> dict:
+        """Get DHCP lease details by IP address.
+
+        Returns:
+            Dictionary with lease details (id, comment, etc) or empty dict if not found
+        """
+        try:
+            leases = self._req("GET", "ip/dhcp-server/lease")
+            logger.debug(f"Found {len(leases)} DHCP leases, searching for IP {target_ip}")
+
+            # Strip CIDR notation from target IP if present
+            clean_target_ip = target_ip.split('/')[0] if '/' in target_ip else target_ip
+
+            for lease in leases:
+                address = lease.get("address", "")
+                # Strip CIDR notation from lease address for comparison
+                clean_address = address.split('/')[0] if '/' in address else address
+
+                if clean_address == clean_target_ip:
+                    logger.info(f"Found DHCP lease for IP {target_ip}: comment='{lease.get('comment')}'")
+                    return lease
+
+            logger.warning(f"No DHCP lease found for IP {target_ip}")
+            return {}
+        except Exception as e:
+            logger.error(f"Error fetching DHCP lease details: {e}")
+            raise
+
     def delete_dhcp_lease(self, target_ip: str) -> bool:
         """Delete a DHCP lease by IP address."""
         try:
             leases = self._req("GET", "ip/dhcp-server/lease")
             logger.debug(f"Found {len(leases)} DHCP leases, searching for IP {target_ip}")
 
+            # Strip CIDR notation from target IP if present
+            clean_target_ip = target_ip.split('/')[0] if '/' in target_ip else target_ip
+
             lease_id = None
             for lease in leases:
-                address = lease.get("address")
-                logger.debug(f"Checking lease: address={address}, id={lease.get('.id')}")
-                if address == target_ip:
+                address = lease.get("address", "")
+                # Strip CIDR notation from lease address for comparison
+                clean_address = address.split('/')[0] if '/' in address else address
+
+                logger.debug(f"Checking lease: address={address}, clean_address={clean_address}, id={lease.get('.id')}")
+                if clean_address == clean_target_ip:
                     lease_id = lease.get(".id")
                     logger.info(f"Found lease ID {lease_id} for IP {target_ip}")
                     break
@@ -281,6 +321,30 @@ class MikroTikClient:
             return result
         except Exception as e:
             logger.error(f"Error creating/updating queue: {e}")
+            raise
+
+    def get_queue_details(self, target_ip: str) -> dict:
+        """Get queue details by target IP.
+
+        Returns:
+            Dictionary with queue details (id, name, comment, etc) or empty dict if not found
+        """
+        try:
+            queues = self._req("GET", "queue/simple")
+            logger.debug(f"Found {len(queues)} queues, searching for target {target_ip}")
+
+            for queue in queues:
+                target = queue.get("target", "")
+                # Handle both "100.64.12.99" and "100.64.12.99/32" formats
+                queue_target = target.split('/')[0] if target else ""
+                if queue_target == target_ip:
+                    logger.info(f"Found queue for IP {target_ip}: name='{queue.get('name')}', comment='{queue.get('comment')}'")
+                    return queue
+
+            logger.warning(f"No queue found for target IP {target_ip}")
+            return {}
+        except Exception as e:
+            logger.error(f"Error fetching queue details: {e}")
             raise
 
     def delete_queue(self, target_ip: str) -> bool:
