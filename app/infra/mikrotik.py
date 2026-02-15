@@ -48,11 +48,23 @@ class MikroTikClient:
             leases = self._req("GET", "ip/dhcp-server/lease")
             # Strip CIDR notation from IPs (MikroTik may return addresses like "100.64.14.2/32")
             # to ensure consistent comparison in find_first_free_ip()
-            used_ips = {
-                lease.get("address", "").split('/')[0]
-                for lease in leases
-                if "address" in lease
-            }
+            used_ips = set()
+            cidr_stripped_count = 0
+
+            for lease in leases:
+                address = lease.get("address", "")
+                if address:
+                    if '/' in address:
+                        clean_address = address.split('/')[0]
+                        used_ips.add(clean_address)
+                        cidr_stripped_count += 1
+                        logger.debug(f"Stripped CIDR notation: {address} → {clean_address}")
+                    else:
+                        used_ips.add(address)
+
+            if cidr_stripped_count > 0:
+                logger.info(f"Stripped CIDR notation from {cidr_stripped_count} DHCP leases")
+                logger.debug(f"Used IPs (after stripping): {sorted(used_ips)}")
 
             # Filter to only IPs within the specified range
             if dhcp_range:
@@ -129,6 +141,7 @@ class MikroTikClient:
             logger.info(f"Available IPs in range: {available_count}/{total_ips}")
 
             # Only iterate within the defined range boundaries
+            allocation_attempt = 0
             for ip_int in range(int(start_ip), int(end_ip) + 1):
                 ip_str = str(ipaddress.IPv4Address(ip_int))
 
@@ -138,8 +151,17 @@ class MikroTikClient:
                     continue
 
                 if ip_str not in used_ips:
-                    logger.info(f"Allocated free IP: {ip_str} (position {ip_int - int(start_ip) + 1}/{total_ips} in range)")
+                    allocation_attempt += 1
+                    position = ip_int - int(start_ip) + 1
+                    logger.info(f"✅ Allocated free IP: {ip_str} (position {position}/{total_ips} in range)")
+                    logger.debug(f"   Searched {allocation_attempt} IP(s) to find this free one")
+                    logger.debug(f"   Used IPs before this allocation: {sorted(used_ips)}")
                     return ip_str
+                else:
+                    allocation_attempt += 1
+                    logger.debug(f"   IP {ip_str} is in use, skipping...")
+                    if allocation_attempt <= 5:  # Log first 5 attempts
+                        logger.debug(f"     (reason: in used_ips set)")
 
             # Range exhausted - provide diagnostic info
             logger.error(f"DHCP range exhausted: {dhcp_range}")
