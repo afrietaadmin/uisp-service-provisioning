@@ -47,11 +47,16 @@ def handle_provision():
         event_name = data.get("eventName")
         webhook_uuid = data.get("uuid")
         extra_data = data.get("extraData", {})
+        webhook_timestamp = data.get("timestamp")  # UISP may include timestamp
+        webhook_change_time = data.get("changeTime")  # UISP may include changeTime
 
         logging.info(
             f"Webhook received: changeType={change_type} entity={entity_type} "
             f"entityId={entity_id} eventName={event_name} uuid={webhook_uuid}"
         )
+
+        # Log all available fields for debugging
+        logging.debug(f"Full webhook payload: {data}")
 
         # Check for duplicate webhook using idempotency store
         if webhook_uuid:

@@ -6,9 +6,11 @@ import re
 def escape_markdown(text: str) -> str:
     """Escape special Markdown characters for Telegram.
 
-    Escapes: *, _, `, [, ], (, ), #, +, -, ., !
+    Escapes: *, _, `, [, ], (, ), #, +, -
     These characters have special meaning in Markdown and need to be escaped
     with a backslash to display literally.
+
+    Note: Period (.) and exclamation (!) are safe and do not need escaping.
 
     Args:
         text: Text to escape
@@ -17,7 +19,7 @@ def escape_markdown(text: str) -> str:
         Text with special Markdown characters escaped
     """
     # Characters that need escaping in Telegram Markdown
-    special_chars = r'[*_`\[\]()#+\-.]'
+    special_chars = r'[*_`\[\]()#+\-]'
     return re.sub(special_chars, r'\\\g<0>', text)
 
 
