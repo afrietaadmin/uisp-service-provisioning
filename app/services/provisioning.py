@@ -18,6 +18,7 @@ def get_router_config(assigned_nas: str) -> dict:
     """Load router configuration from nas_config.json based on assigned NAS name."""
     import json
     import os
+    import ipaddress
 
     config_path = os.getenv("NAS_CONFIG_PATH", "/etc/uisp/nas_config.json")
     try:
@@ -31,6 +32,33 @@ def get_router_config(assigned_nas: str) -> dict:
         router = nas_config.get(assigned_nas)
         if not router:
             raise ValueError(f"No router found for NAS: {assigned_nas}")
+
+        # Log reserved vs allocatable ranges
+        router_ip_range = router.get("router_ip_range")
+        dhcp_range = router.get("dhcp_range")
+
+        if router_ip_range and dhcp_range:
+            logger.info(f"Router Configuration for {assigned_nas}:")
+            logger.info(f"  Full Network (router_ip_range): {router_ip_range}")
+            logger.info(f"  Allocatable Range (dhcp_range): {dhcp_range}")
+
+            # Identify reserved IPs
+            try:
+                if '/' in router_ip_range:
+                    # CIDR notation
+                    network = ipaddress.IPv4Network(router_ip_range, strict=False)
+                    if '-' in dhcp_range:
+                        # Extract start of DHCP range
+                        dhcp_start_str = dhcp_range.split('-')[0].strip()
+                        dhcp_start = ipaddress.IPv4Address(dhcp_start_str)
+                        network_start = network.network_address
+
+                        if network_start < dhcp_start:
+                            reserved_end = ipaddress.IPv4Address(int(dhcp_start) - 1)
+                            logger.info(f"  🔒 Reserved IPs: {network_start} - {reserved_end}")
+                            logger.info(f"  ✅ Allocatable IPs: {dhcp_start} - (see dhcp_range end)")
+            except Exception as e:
+                logger.debug(f"Could not parse reserved IP range: {e}")
 
         return router
     except Exception as e:

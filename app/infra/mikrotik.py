@@ -127,6 +127,10 @@ class MikroTikClient:
 
             total_ips = int(end_ip) - int(start_ip) + 1
             logger.info(f"DHCP Range [{range_type}]: {dhcp_range} → {start_ip} to {end_ip} ({total_ips} total IPs)")
+            logger.info(f"⚠️  IP Allocation Boundaries:")
+            logger.info(f"    First allocatable IP: {start_ip}")
+            logger.info(f"    Last allocatable IP: {end_ip}")
+            logger.info(f"    Any IP outside this range will be REJECTED")
 
             # Get used IPs ONLY within the specified DHCP range
             used_ips = self.get_used_ips(dhcp_range=dhcp_range)
@@ -142,20 +146,27 @@ class MikroTikClient:
 
             # Only iterate within the defined range boundaries
             allocation_attempt = 0
+            reserved_attempts = 0
+
             for ip_int in range(int(start_ip), int(end_ip) + 1):
                 ip_str = str(ipaddress.IPv4Address(ip_int))
 
-                # Double-check IP is actually in range (should always be true)
+                # Double-check IP is actually in range (safety check)
                 if not (start_ip <= ipaddress.IPv4Address(ip_str) <= end_ip):
-                    logger.error(f"CRITICAL: IP {ip_str} is outside defined range {dhcp_range}!")
+                    reserved_attempts += 1
+                    logger.error(f"❌ REJECTED: IP {ip_str} is OUTSIDE defined range {dhcp_range}!")
+                    if reserved_attempts == 1:
+                        logger.error(f"   This is a RESERVED IP (infrastructure use only)")
                     continue
 
                 if ip_str not in used_ips:
                     allocation_attempt += 1
                     position = ip_int - int(start_ip) + 1
-                    logger.info(f"✅ Allocated free IP: {ip_str} (position {position}/{total_ips} in range)")
-                    logger.debug(f"   Searched {allocation_attempt} IP(s) to find this free one")
-                    logger.debug(f"   Used IPs before this allocation: {sorted(used_ips)}")
+                    logger.info(f"✅ ALLOCATED IP: {ip_str}")
+                    logger.info(f"   Position in range: {position}/{total_ips}")
+                    logger.info(f"   Range: {start_ip} to {end_ip}")
+                    logger.info(f"   Searched {allocation_attempt} IP(s) before finding this free one")
+                    logger.debug(f"   Used IPs at time of allocation: {sorted(used_ips)}")
                     return ip_str
                 else:
                     allocation_attempt += 1
