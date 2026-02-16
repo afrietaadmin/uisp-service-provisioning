@@ -68,8 +68,9 @@ def get_router_config(assigned_nas: str) -> dict:
 
 def provision_service(service_id: int, client_id: int, mac_address: str, assigned_nas: str,
                      service_identifier: str, upload_speed: int, download_speed: int,
-                     tg: TelegramNotifier) -> dict:
-    """Provision a service: create DHCP lease, queue, and update UISP."""
+                     tg: TelegramNotifier, unms_client_site_id: str = None,
+                     router_serial: str = None) -> dict:
+    """Provision a service: create DHCP lease, queue, register blackbox, and update UISP."""
     cfg = load_config()
 
     try:
@@ -155,6 +156,36 @@ def provision_service(service_id: int, client_id: int, mac_address: str, assigne
             logger.error(f"❌ DHCP lease creation failed for {free_ip}: {e}")
             tg.send(f"❌ DHCP lease creation failed for {clean_free_ip}: {str(e)}", level="error")
             raise
+
+        # Register blackbox device in UISP NMS
+        if unms_client_site_id:
+            try:
+                import json as _json
+                import os
+                nas_config_path = os.getenv("NAS_CONFIG_PATH", "/etc/uisp/nas_config.json")
+                with open(nas_config_path, 'r') as f:
+                    nas_cfg = _json.load(f)
+                nms_auth_token = nas_cfg.get("uisp_nms_auth_token")
+
+                if nms_auth_token:
+                    uisp.register_blackbox_device(
+                        nms_auth_token=nms_auth_token,
+                        site_id=unms_client_site_id,
+                        hostname=final_service_identifier,
+                        ip_address=clean_free_ip,
+                        mac_address=formatted_mac,
+                        router_serial=router_serial or ""
+                    )
+                    logger.info(f"✅ Blackbox device registered in UISP NMS for {clean_free_ip}")
+                    tg.send(f"📡 Blackbox registered: {final_service_identifier} | IP {clean_free_ip}", level="info")
+                else:
+                    logger.warning("No uisp_nms_auth_token in NAS config, skipping blackbox registration")
+            except Exception as e:
+                logger.error(f"❌ Blackbox registration failed for {clean_free_ip}: {e}")
+                tg.send(f"⚠️ Blackbox registration failed for {clean_free_ip}: {str(e)}", level="warn")
+                # Don't raise - lease was created, continue with queue creation
+        else:
+            logger.warning(f"No unmsClientSiteId for service {service_id}, skipping blackbox registration")
 
         # Create queue on dedicated queue router (102.209.144.2) irrespective of assigned NAS
         queue_router_ip = "102.209.144.2"
@@ -258,8 +289,9 @@ def provision_service(service_id: int, client_id: int, mac_address: str, assigne
 
 
 def deprovision_service(service_id: int, assigned_nas: str, target_ip: str,
-                       service_identifier: str, tg: TelegramNotifier) -> dict:
-    """Deprovision a service: delete DHCP lease, queue, and update UISP."""
+                       service_identifier: str, tg: TelegramNotifier,
+                       unms_client_site_id: str = None) -> dict:
+    """Deprovision a service: delete DHCP lease, queue, NMS devices/site, and update UISP."""
     cfg = load_config()
     clean_target_ip = clean_ip_address(target_ip)
 
@@ -354,12 +386,51 @@ def deprovision_service(service_id: int, assigned_nas: str, target_ip: str,
             queue_deleted = False
             # Continue to UISP update attempt
 
-        # Update UISP service attributes
-        logger.info(f"Updating UISP service {service_id}")
-        uisp = UISPClient(cfg.uisp_base_url, cfg.uisp_app_key)
-        uisp.update_service_deprovisioned(service_id)
-        logger.info(f"UISP service {service_id} marked as deprovisioned")
-        tg.send(f"UISP updated: Service {service_id} deprovisioned ({service_identifier})", level="info")
+        # Deregister devices and site from UISP NMS
+        nms_result = None
+        if unms_client_site_id:
+            try:
+                import json as _json
+                import os
+                nas_config_path = os.getenv("NAS_CONFIG_PATH", "/etc/uisp/nas_config.json")
+                with open(nas_config_path, 'r') as f:
+                    nas_cfg = _json.load(f)
+                nms_auth_token = nas_cfg.get("uisp_nms_auth_token")
+
+                if nms_auth_token:
+                    uisp_nms = UISPClient(cfg.uisp_base_url, cfg.uisp_app_key)
+                    nms_result = uisp_nms.deregister_blackbox_devices(
+                        nms_auth_token=nms_auth_token,
+                        site_id=unms_client_site_id,
+                        service_identifier=service_identifier
+                    )
+                    devices_del = len(nms_result.get("devices_deleted", []))
+                    devices_skip = len(nms_result.get("devices_skipped", []))
+                    site_del = nms_result.get("site_deleted", False)
+                    logger.info(f"✅ NMS deprovisioning: {devices_del} device(s) deleted, {devices_skip} skipped, site deleted: {site_del}")
+                    tg.send(
+                        f"📡 NMS deprovisioned: {service_identifier} | "
+                        f"{devices_del} device(s) deleted, site {'deleted' if site_del else 'NOT deleted'}",
+                        level="info"
+                    )
+                else:
+                    logger.warning("No uisp_nms_auth_token in NAS config, skipping NMS deprovisioning")
+            except Exception as e:
+                logger.error(f"❌ NMS deprovisioning failed for site {unms_client_site_id}: {e}")
+                tg.send(f"⚠️ NMS deprovisioning failed for {service_identifier}: {str(e)}", level="warn")
+        else:
+            logger.warning(f"No unmsClientSiteId for service {service_id}, skipping NMS deprovisioning")
+
+        # Only update UISP if we actually deleted something - otherwise we trigger
+        # a feedback loop (UISP fires a new webhook for every service edit we make)
+        if lease_deleted or queue_deleted:
+            logger.info(f"Updating UISP service {service_id}")
+            uisp = UISPClient(cfg.uisp_base_url, cfg.uisp_app_key)
+            uisp.update_service_deprovisioned(service_id)
+            logger.info(f"UISP service {service_id} marked as deprovisioned")
+            tg.send(f"UISP updated: Service {service_id} deprovisioned ({service_identifier})", level="info")
+        else:
+            logger.info(f"Service {service_id} already deprovisioned (no lease/queue found), skipping UISP update to avoid feedback loop")
 
         return {
             "ok": True,
@@ -432,6 +503,11 @@ def handle_service_event(change_type: str, entity_type: str, entity_id: str, ext
             (a.get("value") for a in attributes if a.get("key") == "provisioningAction"),
             None
         )
+        router_serial = next(
+            (a.get("value") for a in attributes if a.get("key") == "routerSerial"),
+            None
+        )
+        unms_client_site_id = entity.get("unmsClientSiteId")
         download_speed = entity.get("downloadSpeed", 0)
         upload_speed = entity.get("uploadSpeed", 0)
 
@@ -461,7 +537,8 @@ def handle_service_event(change_type: str, entity_type: str, entity_id: str, ext
 
             result = provision_service(
                 service_id, client_id, mac_address, assigned_nas, service_identifier,
-                upload_speed, download_speed, tg
+                upload_speed, download_speed, tg,
+                unms_client_site_id=unms_client_site_id, router_serial=router_serial
             )
 
             return {
@@ -488,7 +565,8 @@ def handle_service_event(change_type: str, entity_type: str, entity_id: str, ext
             logger.info(f"Deprovisioning service {service_id}: {service_identifier} (status={status})")
 
             result = deprovision_service(
-                service_id, assigned_nas, ip_address, service_identifier, tg
+                service_id, assigned_nas, ip_address, service_identifier, tg,
+                unms_client_site_id=unms_client_site_id
             )
 
             # Only send the "Deprovisioning started" notification if resources were actually found and deleted

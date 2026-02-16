@@ -89,7 +89,8 @@ def handle_provision():
                 logging.error(f"Failed to mark webhook as processed: {e}")
                 # Continue processing even if idempotency tracking fails
 
-        return jsonify(result), 200 if result.get("ok") else 202
+        # Always return 200 to UISP to prevent webhook retries
+        return jsonify(result), 200
 
     except Exception as e:
         logging.exception("Error handling provisioning webhook:")

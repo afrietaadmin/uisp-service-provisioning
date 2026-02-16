@@ -1,3 +1,4 @@
+import uuid
 import requests
 import logging
 
@@ -203,3 +204,163 @@ class UISPClient:
             {"value": "", "customAttributeId": 39}  # Mark as deprovisioned
         ]
         return self.update_service_attributes(service_id, attributes)
+
+    def deregister_blackbox_devices(self, nms_auth_token: str, site_id: str,
+                                     service_identifier: str) -> dict:
+        """
+        Remove blackbox devices from UISP NMS during deprovisioning.
+
+        1. GET all devices at the site
+        2. Delete devices where identification.hostname matches service_identifier
+        3. Delete the site itself
+
+        Args:
+            nms_auth_token: x-auth-token for NMS API authentication
+            site_id: unmsClientSiteId from the service entity
+            service_identifier: Service identifier to match against hostname
+
+        Returns:
+            Dict with deletion results
+        """
+        headers = {"x-auth-token": nms_auth_token, "Content-Type": "application/json"}
+        base_nms_url = f"{self.base_url}/nms/api/v2.1"
+
+        # Step 1: Get all devices at the site
+        try:
+            response = requests.get(
+                f"{base_nms_url}/devices",
+                params={"siteId": site_id},
+                headers=headers,
+                timeout=15,
+                verify=False
+            )
+            response.raise_for_status()
+            devices = response.json() if response.text else []
+        except Exception as e:
+            logger.error(f"Failed to fetch devices for site {site_id}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"NMS response body: {e.response.text}")
+            raise
+
+        logger.info(f"Found {len(devices)} device(s) at site {site_id}")
+
+        # Step 2: Delete devices where hostname matches service identifier
+        deleted_devices = []
+        skipped_devices = []
+
+        for device in devices:
+            identification = device.get("identification", {})
+            device_id = identification.get("id")
+            hostname = identification.get("hostname", "")
+            device_name = identification.get("displayName", device_id)
+
+            if hostname == service_identifier:
+                try:
+                    del_response = requests.delete(
+                        f"{base_nms_url}/devices/{device_id}",
+                        headers=headers,
+                        timeout=15,
+                        verify=False
+                    )
+                    del_response.raise_for_status()
+                    deleted_devices.append(device_id)
+                    logger.info(f"Deleted NMS device: {device_name} (id: {device_id})")
+                except Exception as e:
+                    logger.error(f"Failed to delete NMS device {device_name} (id: {device_id}): {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        logger.error(f"NMS response body: {e.response.text}")
+            else:
+                skipped_devices.append({"id": device_id, "hostname": hostname})
+                logger.warning(
+                    f"Skipping NMS device {device_name} (id: {device_id}) - "
+                    f"hostname '{hostname}' does not match service identifier '{service_identifier}'"
+                )
+
+        # Step 3: Delete the site
+        site_deleted = False
+        try:
+            del_response = requests.delete(
+                f"{base_nms_url}/sites/{site_id}",
+                headers=headers,
+                timeout=15,
+                verify=False
+            )
+            del_response.raise_for_status()
+            site_deleted = True
+            logger.info(f"Deleted NMS site: {site_id}")
+        except Exception as e:
+            logger.error(f"Failed to delete NMS site {site_id}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"NMS response body: {e.response.text}")
+
+        return {
+            "devices_deleted": deleted_devices,
+            "devices_skipped": skipped_devices,
+            "site_deleted": site_deleted
+        }
+
+    def register_blackbox_device(self, nms_auth_token: str, site_id: str, hostname: str,
+                                  ip_address: str, mac_address: str, router_serial: str) -> dict:
+        """
+        Register a device as a blackbox in UISP NMS after lease creation.
+
+        Args:
+            nms_auth_token: x-auth-token for NMS API authentication
+            site_id: unmsClientSiteId from the service entity
+            hostname: Service identifier (customAttributeId 24)
+            ip_address: Allocated IP address
+            mac_address: Device MAC address
+            router_serial: Router serial number (customAttributeId 22)
+
+        Returns:
+            NMS API response dict
+        """
+        device_id = str(uuid.uuid4())
+        payload = {
+            "deviceId": device_id,
+            "siteId": site_id,
+            "hostname": hostname,
+            "modelName": router_serial,
+            "systemName": None,
+            "vendorName": None,
+            "ipAddress": ip_address,
+            "macAddress": mac_address,
+            "pingEnabled": False,
+            "snmpCommunity": "public",
+            "deviceRole": "router",
+            "note": None,
+            "interfaces": [
+                {
+                    "id": "eth1",
+                    "name": "eth1",
+                    "position": 1,
+                    "mac": None,
+                    "type": "eth",
+                    "addresses": [
+                        f"{ip_address}/32"
+                    ]
+                }
+            ]
+        }
+
+        url = f"{self.base_url}/nms/api/v2.1/devices/blackboxes/config"
+        logger.info(f"Registering blackbox device: {hostname} (IP: {ip_address}, siteId: {site_id})")
+        logger.debug(f"Blackbox payload: {payload}")
+
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers={"x-auth-token": nms_auth_token, "Content-Type": "application/json"},
+                timeout=15,
+                verify=False
+            )
+            response.raise_for_status()
+            result = response.json() if response.text else {}
+            logger.info(f"Blackbox device registered: {hostname} (deviceId: {device_id})")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to register blackbox device {hostname}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"NMS response body: {e.response.text}")
+            raise
